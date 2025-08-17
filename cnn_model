@@ -1,0 +1,313 @@
+import math
+import random
+import os
+from collections import namedtuple, deque
+import numpy as np
+import pygame
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+
+# Define Transition for experience replay
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done'))
+
+# Enhanced Snake Game Environment
+class SnakeGame:
+    def __init__(self, width=16, height=16):
+        self.width = width
+        self.height = height
+        self.frame_stack = 4  # Number of frames to stack for motion perception
+        self.max_steps_without_food = 100  # Delay penalty to 100 steps
+        self.state_history = deque(maxlen=self.frame_stack)
+        self.reset()
+
+    def reset(self):
+        """Reset game state, snake initial length 4"""
+        self.snake = [
+            (self.width // 2, self.height // 2),  # Head
+            (self.width // 2, self.height // 2 + 1),
+            (self.width // 2, self.height // 2 + 2),
+            (self.width // 2, self.height // 2 + 3)
+        ]  # Initial length 4, vertical downward
+        self.food = self._place_food()
+        self.direction = (0, -1)  # Initial direction: up
+        self.score = 0
+        self.game_over = False
+        self.steps_without_food = 0
+        self.prev_dist_to_food = self._manhattan_dist(self.snake[0], self.food)
+        initial_frame = self._get_single_frame()
+        self.state_history = deque([initial_frame] * self.frame_stack, maxlen=self.frame_stack)
+        return self._get_stacked_state()
+
+    def _place_food(self):
+        while True:
+            food = (random.randint(0, self.width - 1), random.randint(0, self.height - 1))
+            if food not in self.snake:
+                return food
+
+    def _manhattan_dist(self, pos1, pos2):
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+
+    def step(self, action):
+        self.steps_without_food += 1
+        directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # Up, right, down, left
+        self.direction = directions[action]
+        head = self.snake[0]
+        new_head = (head[0] + self.direction[0], head[1] + self.direction[1])
+
+        # Check wall or self-collision
+        if (new_head[0] < 0 or new_head[0] >= self.width or
+            new_head[1] < 0 or new_head[1] >= self.height or
+            new_head in self.snake):
+            self.game_over = True
+            return self._get_stacked_state(), -5.0, True  # Reduced penalty
+
+        self.snake.insert(0, new_head)
+        reward = 0
+        new_dist = self._manhattan_dist(new_head, self.food)
+        if new_dist < self.prev_dist_to_food:
+            reward += 1.0
+        elif new_dist > self.prev_dist_to_food:
+            reward -= 1.0
+        self.prev_dist_to_food = new_dist
+
+        if new_head == self.food:
+            if self.score <= 20:
+                self.score += 1  # Increment score per food
+                reward += 10.0 + 5.0 * self.score  # Scaling reward
+                self.food = self._place_food()
+                self.steps_without_food = 0
+                self.prev_dist_to_food = self._manhattan_dist(new_head, self.food)
+            elif self.score > 20:
+                self.score += 1  # Increment score per food
+                reward += self.score * self.score  # Scaling reward
+                self.food = self._place_food()
+                self.steps_without_food = 0
+                self.prev_dist_to_food = self._manhattan_dist(new_head, self.food)
+
+        else:
+            self.snake.pop()
+            if self.steps_without_food >= self.max_steps_without_food:
+                reward -= 1.0
+
+        next_frame = self._get_single_frame()
+        self.state_history.append(next_frame)
+        return self._get_stacked_state(), reward, self.game_over
+
+    def _get_single_frame(self):
+        """Return single image state (height, width, 3)"""
+        state = np.zeros((self.height, self.width, 3), dtype=np.float32)
+        head = self.snake[0]
+        state[head[1], head[0], 0] = 1.0
+        for segment in self.snake[1:]:
+            state[segment[1], segment[0], 1] = 1.0
+        state[self.food[1], self.food[0], 2] = 1.0
+        return state
+
+    def _get_stacked_state(self):
+        """Return stacked state (height, width, 3 * frame_stack)"""
+        return np.concatenate(list(self.state_history), axis=-1)
+
+    def render(self, screen=None):
+        if screen is None:
+            return
+        screen.fill((0, 0, 0))
+        cell_size = 20
+        for segment in self.snake:
+            pygame.draw.rect(screen, (0, 255, 0), (segment[0] * cell_size, segment[1] * cell_size, cell_size, cell_size))
+        pygame.draw.rect(screen, (255, 0, 0), (self.food[0] * cell_size, self.food[1] * cell_size, cell_size, cell_size))
+        pygame.display.flip()
+
+# Replay Memory
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.memory = deque(maxlen=capacity)
+
+    def push(self, *args):
+        self.memory.append(Transition(*args))
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
+
+# CNN-based DQN Model
+class DQN(nn.Module):
+    def __init__(self, height, width, output_dim, frame_stack=4):
+        super(DQN, self).__init__()
+        self.conv1 = nn.Conv2d(3 * frame_stack, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.fc1 = nn.Linear(64 * height * width, 512)
+        self.fc2 = nn.Linear(512, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+# Enhanced DQN Agent
+class DQNAgent:
+    def __init__(self, height, width, action_dim, device, model_path="cnn_dqn_model2.pth", frame_stack=4):
+        self.device = device
+        self.model_path = model_path
+        self.policy_net = DQN(height, width, action_dim, frame_stack).to(device)
+        self.target_net = DQN(height, width, action_dim, frame_stack).to(device)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.0005)
+        self.memory = ReplayMemory(100000)
+        self.batch_size = 128
+        self.gamma = 0.99
+        self.eps_start = 0.9
+        self.eps_end = 0.05
+        self.eps_decay = 1000
+        self.steps_done = 0
+        self.load_model()
+
+    def select_action(self, state):
+        sample = random.random()
+        eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * \
+                        math.exp(-1. * self.steps_done / self.eps_decay)
+        self.steps_done += 1
+        if sample > eps_threshold:
+            with torch.no_grad():
+                return self.policy_net(state).max(1)[1].view(1, 1)
+        else:
+            return torch.tensor([[random.randrange(4)]], device=self.device, dtype=torch.long)
+
+    def optimize_model(self):
+        if len(self.memory) < self.batch_size:
+            return
+        transitions = self.memory.sample(self.batch_size)
+        batch = Transition(*zip(*transitions))
+
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)),
+                                      device=self.device, dtype=torch.bool)
+        non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
+        state_batch = torch.cat(batch.state)
+        action_batch = torch.cat(batch.action)
+        reward_batch = torch.cat(batch.reward)
+        done_batch = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
+
+        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
+        next_state_values = torch.zeros(self.batch_size, device=self.device)
+        with torch.no_grad():
+            next_actions = self.policy_net(non_final_next_states).max(1)[1].unsqueeze(1)
+            next_state_values[non_final_mask] = self.target_net(non_final_next_states).gather(1, next_actions).squeeze(1)
+        expected_state_action_values = reward_batch + (1 - done_batch) * self.gamma * next_state_values
+
+        loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+        self.optimizer.zero_grad()
+        loss.backward()
+        for param in self.policy_net.parameters():
+            param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+
+    def update_target_net(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    def save_model(self):
+        torch.save({
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'steps_done': self.steps_done
+        }, self.model_path)
+        print(f"Model saved to {self.model_path}")
+
+    def load_model(self):
+        if os.path.exists(self.model_path):
+            try:
+                checkpoint = torch.load(self.model_path)
+                self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+                self.target_net.load_state_dict(checkpoint['policy_net_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.steps_done = checkpoint['steps_done']
+                print(f"Model loaded from {self.model_path}, steps_done: {self.steps_done}")
+            except RuntimeError as e:
+                print(f"Error loading model due to architecture mismatch: {e}")
+                print("Starting fresh training with new architecture")
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+        else:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+            print("No saved model found, starting fresh training")
+
+# Main Training Loop
+def train_dqn():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    width, height = 20, 20
+    env = SnakeGame(width=width, height=height)
+    agent = DQNAgent(height, width, action_dim=4, device=device, model_path="cnn_dqn_model2.pth")
+    num_episodes = 500000
+    target_update = 5
+    best_score = 0
+    best_total_reward = float('-inf')
+    writer = SummaryWriter()
+
+    pygame.init()
+    screen = pygame.display.set_mode((width * 20, height * 20))
+    print("Pygame initialized, training started...")
+
+    recent_scores = deque(maxlen=100)
+    recent_rewards = deque(maxlen=100)
+
+    for episode in range(num_episodes):
+        state = env.reset()
+        state = torch.from_numpy(state).permute(2, 0, 1).unsqueeze(0).to(device).float()  # (1, 12, h, w)
+        total_reward = 0
+        print(f"Episode {episode} started, initial score: {env.score}")
+
+        while not env.game_over:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    print("Pygame window closed, saving model and exiting...")
+                    agent.save_model()
+                    pygame.quit()
+                    writer.close()
+                    return
+
+            action = agent.select_action(state)
+            next_state, reward, done = env.step(action.item())
+            total_reward += reward
+
+            next_state_tensor = None if done else torch.from_numpy(next_state).permute(2, 0, 1).unsqueeze(0).to(device).float()
+            reward_tensor = torch.tensor([reward], device=device)
+            agent.memory.push(state, action, next_state_tensor, reward_tensor, done)
+
+            state = next_state_tensor
+            agent.optimize_model()
+            env.render(screen)
+
+            if done:
+                print(f"Episode {episode} ended, Score: {env.score}, Total Reward: {total_reward}, Snake Length: {len(env.snake)}")
+                writer.add_scalar("Score/Episode", env.score, episode)
+                writer.add_scalar("Total_Reward/Episode", total_reward, episode)
+                writer.add_scalar("Snake_Length/Episode", len(env.snake), episode)
+                recent_scores.append(env.score)
+                recent_rewards.append(total_reward)
+                if episode % 100 == 0 and episode > 0:
+                    avg_score = np.mean(recent_scores)
+                    avg_reward = np.mean(recent_rewards)
+                    print(f"Episode {episode}, Avg Score (last 100): {avg_score:.2f}, Avg Reward (last 100): {avg_reward:.2f}")
+                break
+
+        if episode % target_update == 0:
+            agent.update_target_net()
+
+        if env.score > best_score or total_reward > best_total_reward or episode % 100 == 0:
+            if env.score > best_score:
+                best_score = env.score
+            if total_reward > best_total_reward:
+                best_total_reward = total_reward
+            agent.save_model()
+
+    print("Training completed!")
+    agent.save_model()
+    writer.close()
+    pygame.quit()
+
+if __name__ == "__main__":
+    train_dqn()
